@@ -96,7 +96,9 @@ msg = model.first_stage_model.load_state_dict(state_dict, strict=False)
 print(f"loaded LDM decoder state_dict with message\n{msg}")
 print("you should check that the decoder keys are correctly matched")
 ```
-For instance with: [WM weights of SD2 decoder](s3://dl.fbaipublicfiles.com/ssl_watermarking/sd2_decoder.pth), the weights obtained after running [this command](https://justpaste.it/ae93f).
+For instance with: [WM weights of SD2 decoder](https://dl.fbaipublicfiles.com/ssl_watermarking/sd2_decoder.pth), the weights obtained after running [this command](https://justpaste.it/ae93f).
+
+
 
 ### Decode
 
