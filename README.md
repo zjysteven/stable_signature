@@ -53,6 +53,8 @@ Create LDM configs and checkpoints from the [Hugging Face](https://huggingface.c
 The code should also work for Stable Diffusion v1 without any change. 
 For other models (like old LDMs or VQGANs), you may need to adapt the code to load the checkpoints.
 
+An example of watermarked weights is available at [WM weights of SD2 decoder](https://dl.fbaipublicfiles.com/ssl_watermarking/sd2_decoder.pth) (the key is the one present in the `decoding.ipynb` file).
+
 #### Perceptual Losses
 
 The perceptual losses are based on [this repo](https://github.com/SteffenCzolbe/PerceptualSimilarity/).
@@ -96,6 +98,9 @@ msg = model.first_stage_model.load_state_dict(state_dict, strict=False)
 print(f"loaded LDM decoder state_dict with message\n{msg}")
 print("you should check that the decoder keys are correctly matched")
 ```
+
+You should also comment the lines that add the post-hoc watermark of SD: `img = put_watermark(img, wm_encoder)`.
+
 For instance with: [WM weights of SD2 decoder](https://dl.fbaipublicfiles.com/ssl_watermarking/sd2_decoder.pth), the weights obtained after running [this command](https://justpaste.it/ae93f).
 
 
