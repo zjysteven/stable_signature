@@ -101,7 +101,7 @@ print("you should check that the decoder keys are correctly matched")
 
 You should also comment the lines that add the post-hoc watermark of SD: `img = put_watermark(img, wm_encoder)`.
 
-For instance with: [WM weights of SD2 decoder](https://dl.fbaipublicfiles.com/ssl_watermarking/sd2_decoder.pth), the weights obtained after running [this command](https://justpaste.it/ae93f).
+For instance with: [WM weights of SD2 decoder](https://dl.fbaipublicfiles.com/ssl_watermarking/sd2_decoder.pth), the weights obtained after running [this command](https://justpaste.it/ae93f). In this case, the state dict only contains the 'ldm_decoder' key, so you only need to load with `state_dict = torch.load(path/to/ckpt.pth)`
 
 
 
