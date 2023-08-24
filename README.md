@@ -6,7 +6,6 @@ For details, see [**the paper**](https://arxiv.org/abs/2303.15435) (or go to ICC
 [[`Webpage`](https://pierrefdz.github.io/publications/stablesignature/)]
 [[`arXiv`](https://arxiv.org/abs/2303.15435)]
 
-
 ## Setup
 
 
@@ -45,7 +44,7 @@ We additionally provide another extractor model, which has been trained with blu
 | Extractor | [dec_48b.pth](https://dl.fbaipublicfiles.com/ssl_watermarking/dec_48b.pth) | [dec_48b_whit.torchscript.pt](https://dl.fbaipublicfiles.com/ssl_watermarking/dec_48b_whit.torchscript.pt)  |
 | Other | [other_dec_48b_whit.pth](https://dl.fbaipublicfiles.com/ssl_watermarking/other_dec_48b.pth) | [other_dec_48b_whit.torchscript.pt](https://dl.fbaipublicfiles.com/ssl_watermarking/dec_48b_whit.torchscript.pt) |
 
-Code to train the watermark models will be made available soon (incoming days).
+Code to train the watermark models is available in the folder called `hidden/`.
 
 #### Stable Diffusion models
 
@@ -68,6 +67,10 @@ rm -r PerceptualSimilarity
 
 
 ## Usage
+
+### Watermark pre-training
+
+Please see [hidden/README.md](https://github.com/facebookresearch/stable_signature/tree/main/hidden/README.md) for details on how to train the watermark encoder/extractor.
 
 ### Fine-tune LDM decoder
 

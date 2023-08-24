@@ -7,6 +7,8 @@ The main differences are:
 
 Another implementation is available at [ando-khachatryan/HiDDeN](https://github.com/ando-khachatryan/HiDDeN).
 
+Using the pre-trained networks for vanilla image watermarking: [`Colab demo`](https://colab.research.google.com/github/facebookresearch/stable_signature/blob/master/hidden/notebooks/demo.ipynb)
+
 ## Setup
 
 ### Requirements
