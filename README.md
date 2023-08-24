@@ -62,7 +62,7 @@ You should download the weights here: https://github.com/SteffenCzolbe/Perceptua
 To do so you can run 
 ```
 git clone https://github.com/SteffenCzolbe/PerceptualSimilarity.git
-cp PerceptualSimilarity/src/loss/weights losses
+cp -r PerceptualSimilarity/src/loss/weights losses
 rm -r PerceptualSimilarity
 ```
 
