@@ -1,5 +1,8 @@
 # Image Watermarking with Revisited HiDDeN
 
+[`Colab demo`](https://colab.research.google.com/github/facebookresearch/stable_signature/blob/master/hidden/notebooks/demo.ipynb)
+(for using the pre-trained networks for traditional image watermarking.)
+
 This repository is heavily based on the paper [HiDDeN: Hiding Data With Deep Networks](https://arxiv.org/abs/1807.09937).
 The main differences are:
 - there is no adversarial network, nor any image loss,
@@ -7,7 +10,6 @@ The main differences are:
 
 Another implementation is available at [ando-khachatryan/HiDDeN](https://github.com/ando-khachatryan/HiDDeN).
 
-Using the pre-trained networks for vanilla image watermarking: [`Colab demo`](https://colab.research.google.com/github/facebookresearch/stable_signature/blob/master/hidden/notebooks/demo.ipynb)
 
 ## Setup
 
