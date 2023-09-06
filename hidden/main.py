@@ -35,6 +35,7 @@ import time
 import random
 import numpy as np
 from pathlib import Path
+import pandas as pd
 
 import torch
 import torch.nn as nn
@@ -49,6 +50,7 @@ import utils
 import utils_img
 import models
 import attenuations
+from attacks import attack_modules
 
 device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
@@ -74,11 +76,13 @@ def get_parser():
     aa('--encoder_depth', default=4, type=int, help='Number of blocks in the encoder.')
     aa('--encoder_channels', default=64, type=int, help='Number of channels in the encoder.')
     aa("--use_tanh", type=utils.bool_inst, default=True, help="Use tanh scaling. (Default: True)")
+    aa("--encoder_use_skip", type=utils.bool_inst, default=False, help="Use skip connections. (Default: False)")
 
     group = parser.add_argument_group('Decoder parameters')
     aa("--decoder", type=str, default="hidden", help="Decoder type (Default: hidden)")
     aa("--decoder_depth", type=int, default=8, help="Number of blocks in the decoder (Default: 4)")
     aa("--decoder_channels", type=int, default=64, help="Number of blocks in the decoder (Default: 4)")
+    aa("--decoder_use_skip", type=utils.bool_inst, default=False, help="Use skip connections. (Default: False)")
 
     group = parser.add_argument_group('Training parameters')
     aa("--bn_momentum", type=float, default=0.01, help="Momentum of the batch normalization layer. (Default: 0.1)")
@@ -116,6 +120,8 @@ def get_parser():
     aa("--p_jpeg", type=float, default=0.5, help="Probability of the diff JPEG augmentation. (Default: 0.5)")
     aa("--p_rot", type=float, default=0.5, help="Probability of the rotation augmentation. (Default: 0.5)")
     aa("--p_color_jitter", type=float, default=0.5, help="Probability of the color jitter augmentation. (Default: 0.5)")
+    aa("--p_noisy", type=float, default=0.3)
+    aa("--noisy_list", type=utils.string_with_comma, default=["jpeg"])
 
     group = parser.add_argument_group('Distributed training parameters')
     aa('--debug_slurm', action='store_true')
@@ -137,6 +143,11 @@ def main(params):
         # cudnn.benchmark = False
         # cudnn.deterministic = True
 
+        # Set number of threads
+        torch.set_num_threads(params.workers)
+        if utils.is_main_process():
+            print(">>> Number of threads: {}".format(torch.get_num_threads()))
+
     # Set seeds for reproductibility 
     seed = params.seed + utils.get_rank()
     torch.manual_seed(seed)
@@ -146,6 +157,12 @@ def main(params):
     # Print the arguments
     print("__git__:{}".format(utils.get_sha()))
     print("__log__:{}".format(json.dumps(vars(params))))
+
+    # set up saving directory
+    Path(params.output_dir).joinpath("checkpoints").mkdir(parents=True, exist_ok=True)
+    if utils.is_main_process():
+        with (Path(params.output_dir).joinpath("params.txt")).open("w") as f:
+            f.write(json.dumps(vars(params), indent=4))
 
     # handle params that are "none"
     if params.attenuation is not None:
@@ -158,28 +175,50 @@ def main(params):
     # Build encoder
     print('building encoder...')
     if params.encoder == 'hidden':
-        encoder = models.HiddenEncoder(num_blocks=params.encoder_depth, num_bits=params.num_bits, channels=params.encoder_channels, last_tanh=params.use_tanh)
+        encoder = models.HiddenEncoder(
+            num_blocks=params.encoder_depth, 
+            num_bits=params.num_bits, 
+            channels=params.encoder_channels, 
+            last_tanh=params.use_tanh,
+            skip=params.encoder_use_skip
+        )
     elif params.encoder == 'dvmark':
-        encoder = models.DvmarkEncoder(num_blocks=params.encoder_depth, num_bits=params.num_bits, channels=params.encoder_channels, last_tanh=params.use_tanh)
+        encoder = models.DvmarkEncoder(
+            num_blocks=params.encoder_depth, 
+            num_bits=params.num_bits, 
+            channels=params.encoder_channels, 
+            last_tanh=params.use_tanh
+        )
     elif params.encoder == 'vit':
         encoder = models.VitEncoder(
             img_size=params.img_size, patch_size=16, init_values=None,
             embed_dim=params.encoder_channels, depth=params.encoder_depth, 
             num_bits=params.num_bits, last_tanh=params.use_tanh
-            )
+        )
     else:
         raise ValueError('Unknown encoder type')
-    print('\nencoder: \n%s'% encoder)
-    print('total parameters: %d'%sum(p.numel() for p in encoder.parameters()))
+    print('\nencoder: \n%s' % encoder)
+    print('total parameters: %d' % sum(p.numel() for p in encoder.parameters()))
 
     # Build decoder
     print('building decoder...')
     if params.decoder == 'hidden':
-        decoder = models.HiddenDecoder(num_blocks=params.decoder_depth, num_bits=params.num_bits*params.redundancy, channels=params.decoder_channels)
+        if params.decoder_use_skip:
+            decoder = models.HiddenDecoderSkip(
+                num_blocks=params.decoder_depth, 
+                num_bits=params.num_bits, 
+                channels=params.decoder_channels
+            )
+        else:
+            decoder = models.HiddenDecoder(
+                num_blocks=params.decoder_depth, 
+                num_bits=params.num_bits, 
+                channels=params.decoder_channels
+            )
     else:
         raise ValueError('Unknown decoder type')
-    print('\ndecoder: \n%s'% decoder)
-    print('total parameters: %d'%sum(p.numel() for p in decoder.parameters()))
+    print('\ndecoder: \n%s' % decoder)
+    print('total parameters: %d' % sum(p.numel() for p in decoder.parameters()))
     
     # Adapt bn momentum
     for module in [*decoder.modules(), *encoder.modules()]:
@@ -188,13 +227,20 @@ def main(params):
 
     # Construct attenuation
     if params.attenuation == 'jnd':
-        attenuation = attenuations.JND(preprocess = lambda x: utils_img.unnormalize_rgb(x)).to(device)
+        attenuation = attenuations.JND(preprocess=utils.unnormalize_img).to(device)
     else:
         attenuation = None
 
     # Construct data augmentation seen at train time
     if params.data_augmentation == 'combined':
         data_aug = data_augmentation.HiddenAug(params.img_size, params.p_crop, params.p_blur,  params.p_jpeg, params.p_rot,  params.p_color_jitter, params.p_res).to(device)
+    elif params.data_augmentation == 'combined_v1':
+        data_aug = data_augmentation.HiddenAug_v1(
+            params.img_size, 
+            params.p_noisy, 
+            aug_order='parallel',
+            noisy_list=params.noisy_list
+        ).to(device)
     elif params.data_augmentation == 'kornia':
         data_aug = data_augmentation.KorniaAug().to(device)
     elif params.data_augmentation == 'none':
@@ -229,16 +275,16 @@ def main(params):
         transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
-        utils_img.normalize_rgb,
+        utils_img.normalize_img,
     ])
     val_transform = transforms.Compose([
         transforms.Resize(params.img_size),
         transforms.CenterCrop(params.img_size),
         transforms.ToTensor(),
-        utils_img.normalize_rgb,
-        ])
+        utils_img.normalize_img,
+    ])
     train_loader = utils.get_dataloader(params.train_dir, transform=train_transform, batch_size=params.batch_size, num_workers=params.workers, shuffle=True)
-    val_loader = utils.get_dataloader(params.val_dir, transform=val_transform,  batch_size=params.batch_size_eval, num_workers=params.workers, shuffle=False)
+    val_loader = utils.get_dataloader(params.val_dir, transform=val_transform, batch_size=params.batch_size_eval, num_workers=params.workers, shuffle=False)
 
     # optionally resume training 
     if params.resume_from is not None: 
@@ -257,37 +303,59 @@ def main(params):
     for param_group in optimizer.param_groups:
         param_group['lr'] = optim_params['lr']
 
-    # create output dir
-    os.makedirs(params.output_dir, exist_ok=True)
+    # some setup for attack modules
+    attack_modules['resized_crop'].transform.size = params.img_size
+    global attack_list_1, attack_list_2
+    attack_list_1 = [
+        "color_jitter",
+        "center_crop_0.3",
+        "resize_0.3",
+        "resized_crop",
+        "rotate",
+    ]
+    attack_list_2 = [
+        "jpeg_compress_50",
+        "colorize",
+        "motion_deblur_11",
+        "gaussian_denoise",
+        "auto_encode_4"
+    ]
+    for am in attack_list_1 + attack_list_2:
+        attack_modules[am].setup(local_rank=params.local_rank if params.dist else None)
 
     print('training...')
     start_time = time.time()
-    best_bit_acc = 0
-    for epoch in range(start_epoch, params.epochs):
-        
+    for epoch in range(start_epoch + 1, params.epochs + 1):
         if params.dist:
             train_loader.sampler.set_epoch(epoch)
             val_loader.sampler.set_epoch(epoch)
 
         train_stats = train_one_epoch(encoder_decoder, train_loader, optimizer, scheduler, epoch, params)
-        log_stats = {**{f'train_{k}': v for k, v in train_stats.items()}, 'epoch': epoch}
-        
-        if epoch % params.eval_freq == 0:
-            val_stats = eval_one_epoch(encoder_decoder, val_loader, epoch, params)
-            log_stats = {**log_stats, **{f'val_{k}': v for k, v in val_stats.items()}}
+        val_stats = eval_one_epoch(encoder_decoder, val_loader, epoch, params)
+        log_stats = {
+            "epoch": epoch,
+            **{f"train_{k}": v for k, v in train_stats.items()},
+            **{f"val_{k}": v for k, v in val_stats.items()},
+        }
     
         save_dict = {
             'encoder_decoder': encoder_decoder.state_dict(),
             'optimizer': optimizer.state_dict(),
-            'epoch': epoch + 1,
+            'epoch': epoch,
             'params': params,
         }
-        utils.save_on_master(save_dict, os.path.join(params.output_dir, 'checkpoint.pth'))
+        utils.save_on_master(save_dict, os.path.join(params.output_dir, 'checkpoints', 'checkpoint.pth'))
         if params.saveckp_freq and epoch % params.saveckp_freq == 0:
-            utils.save_on_master(save_dict, os.path.join(params.output_dir, f'checkpoint{epoch:03}.pth'))
+            utils.save_on_master(save_dict, os.path.join(params.output_dir, 'checkpoints', f'checkpoint{epoch:03}.pth'))
         if utils.is_main_process():
-            with (Path(params.output_dir) / "log.txt").open("a") as f:
-                f.write(json.dumps(log_stats) + "\n")
+            if epoch == 1:
+                pd.DataFrame(log_stats, index=[epoch - 1]).to_csv(
+                    Path(params.output_dir).joinpath("log.csv"), mode="w", index=False
+                )
+            else:
+                pd.DataFrame(log_stats, index=[epoch - 1]).to_csv(
+                    Path(params.output_dir).joinpath("log.csv"), mode="a", header=False, index=False
+                )
     
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
@@ -335,12 +403,10 @@ def train_one_epoch(encoder_decoder: models.EncoderDecoder, loader, optimizer, s
     header = 'Train - Epoch: [{}/{}]'.format(epoch, params.epochs)
     metric_logger = utils.MetricLogger(delimiter="  ")
 
-    loss = 0
-    optimizer.zero_grad()
     for it, (imgs, _) in enumerate(metric_logger.log_every(loader, 10, header)):
         imgs = imgs.to(device, non_blocking=True) # b c h w
 
-        msgs_ori = torch.rand((imgs.shape[0],params.num_bits)) > 0.5 # b k
+        msgs_ori = torch.rand((imgs.shape[0], params.num_bits)) > 0.5 # b k
         msgs = 2 * msgs_ori.type(torch.float).to(device) - 1 # b k
 
         fts, (imgs_w, imgs_aug) = encoder_decoder(imgs, msgs)
@@ -348,12 +414,12 @@ def train_one_epoch(encoder_decoder: models.EncoderDecoder, loader, optimizer, s
         loss_w = message_loss(fts, msgs, m=params.loss_margin, loss_type=params.loss_w_type) # b k -> 1
         loss_i = image_loss(imgs_w, imgs, loss_type=params.loss_i_type) # b c h w -> 1
         
-        loss += params.lambda_w*loss_w + params.lambda_i*loss_i
+        loss = params.lambda_w * loss_w + params.lambda_i * loss_i
 
         # gradient step
+        optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-        optimizer.zero_grad()
 
         # img stats
         psnrs = utils_img.psnr(imgs_w, imgs) # b 1
@@ -365,25 +431,36 @@ def train_one_epoch(encoder_decoder: models.EncoderDecoder, loader, optimizer, s
         word_accs = (bit_accs == 1) # b
         norm = torch.norm(fts, dim=-1, keepdim=True) # b d -> b 1
         log_stats = {
+            'loss': loss.item(),
             'loss_w': loss_w.item(),
             'loss_i': loss_i.item(),
-            'loss': (params.lambda_w*loss_w + params.lambda_i*loss_i).item(),
-            'psnr_avg': torch.mean(psnrs).item(),
             'lr': optimizer.param_groups[0]['lr'],
-            'bit_acc_avg': torch.mean(bit_accs).item(),
-            'word_acc_avg': torch.mean(word_accs.type(torch.float)).item(),
-            'norm_avg': torch.mean(norm).item(),
+            'psnr': torch.mean(psnrs).item(),
+            'output_norm': torch.mean(norm).item(),
+            'word_acc': torch.mean(word_accs.type(torch.float)).item(),
+            'bit_acc': torch.mean(bit_accs).item(),
         }
         
         torch.cuda.synchronize()
         for name, loss in log_stats.items():
             metric_logger.update(**{name:loss})
-        
-        # if epoch % 1 == 0 and it % 10 == 0 and utils.is_main_process():
+
         if epoch % params.saveimg_freq == 0 and it == 0 and utils.is_main_process():
-            save_image(utils_img.unnormalize_img(imgs), os.path.join(params.output_dir, f'{epoch:03}_{it:03}_train_ori.png'), nrow=8)
-            save_image(utils_img.unnormalize_img(imgs_w), os.path.join(params.output_dir, f'{epoch:03}_{it:03}_train_w.png'), nrow=8)
-            save_image(utils_img.unnormalize_img(imgs_aug), os.path.join(params.output_dir, f'{epoch:03}_{it:03}_train_aug.png'), nrow=8)
+            utils.create_folder_and_save_image(
+                utils_img.unnormalize_img(imgs), 
+                os.path.join(params.output_dir, 'imgs/train_ori', f'{epoch:03}_{it:03}.png'), 
+                nrow=8
+            )
+            utils.create_folder_and_save_image(
+                utils_img.unnormalize_img(imgs_w), 
+                os.path.join(params.output_dir, 'imgs/train_w', f'{epoch:03}_{it:03}.png'), 
+                nrow=8
+            )
+            utils.create_folder_and_save_image(
+                utils_img.unnormalize_img(imgs_aug), 
+                os.path.join(params.output_dir, 'imgs/train_aug', f'{epoch:03}_{it:03}.png'), 
+                nrow=8
+            )
 
     metric_logger.synchronize_between_processes()
     print("Averaged {} stats:".format('train'), metric_logger)
@@ -395,13 +472,28 @@ def eval_one_epoch(encoder_decoder: models.EncoderDecoder, loader, epoch, params
     """
     One epoch of eval.
     """
+    if epoch % params.eval_freq != 0:
+        log_stats = {
+            'loss': 0.,
+            'loss_w': 0.,
+            'loss_i': 0.,
+            'psnr': 0.,
+            'output_norm': 0.,
+            'word_acc': 0.,
+            'bit_acc_clean': 0.,
+        }
+        #for name in attacks.keys():
+        for name in attack_list_1 + attack_list_2:
+            log_stats[f"bit_acc_{name}"] = 0.
+        return log_stats
+
     encoder_decoder.eval()
     header = 'Eval - Epoch: [{}/{}]'.format(epoch, params.epochs)
     metric_logger = utils.MetricLogger(delimiter="  ")
     for it, (imgs, _) in enumerate(metric_logger.log_every(loader, 10, header)):
         imgs = imgs.to(device, non_blocking=True) # b c h w
 
-        msgs_ori = torch.rand((imgs.shape[0],params.num_bits)) > 0.5 # b k
+        msgs_ori = torch.rand((imgs.shape[0], params.num_bits)) > 0.5 # b k
         msgs = 2 * msgs_ori.type(torch.float).to(device) - 1 # b k
 
         fts, (imgs_w, imgs_aug) = encoder_decoder(imgs, msgs, eval_mode=True)
@@ -409,7 +501,7 @@ def eval_one_epoch(encoder_decoder: models.EncoderDecoder, loader, epoch, params
         loss_w = message_loss(fts, msgs,  m=params.loss_margin, loss_type=params.loss_w_type) # b -> 1
         loss_i = image_loss(imgs_w, imgs, loss_type=params.loss_i_type) # b c h w -> 1
         
-        loss = params.lambda_w*loss_w + params.lambda_i*loss_i
+        loss = params.lambda_w * loss_w + params.lambda_i * loss_i
 
         # img stats
         psnrs = utils_img.psnr(imgs_w, imgs) # b 1
@@ -421,29 +513,17 @@ def eval_one_epoch(encoder_decoder: models.EncoderDecoder, loader, epoch, params
         word_accs = (bit_accs == 1) # b
         norm = torch.norm(fts, dim=-1, keepdim=True) # b d -> b 1
         log_stats = {
+            'loss': loss.item(),
             'loss_w': loss_w.item(),
             'loss_i': loss_i.item(),
-            'loss': loss.item(),
-            'psnr_avg': torch.mean(psnrs).item(),
-            'bit_acc_avg': torch.mean(bit_accs).item(),
-            'word_acc_avg': torch.mean(word_accs.type(torch.float)).item(),
-            'norm_avg': torch.mean(norm).item(),
+            'psnr': torch.mean(psnrs).item(),
+            'output_norm': torch.mean(norm).item(),
+            'word_acc': torch.mean(word_accs.type(torch.float)).item(),
+            'bit_acc_clean': torch.mean(bit_accs).item(),
         }
 
-        attacks = {
-            'none': lambda x: x,
-            'crop_01': lambda x: utils_img.center_crop(x, 0.1),
-            'crop_05': lambda x: utils_img.center_crop(x, 0.5),
-            # 'resize_03': lambda x: utils_img.resize(x, 0.3),
-            'resize_05': lambda x: utils_img.resize(x, 0.5),
-            'rot_25': lambda x: utils_img.rotate(x, 25),
-            'rot_90': lambda x: utils_img.rotate(x, 90),
-            'blur': lambda x: utils_img.gaussian_blur(x, sigma=2.0),
-            # 'brightness_2': lambda x: utils_img.adjust_brightness(x, 2),
-            'jpeg_50': lambda x: utils_img.jpeg_compress(x, 50),
-        }
-        for name, attack in attacks.items():
-            fts, (_) = encoder_decoder(imgs, msgs, eval_mode=True, eval_aug=attack)
+        for name in attack_list_1 + attack_list_2:
+            fts, (_) = encoder_decoder(imgs, msgs, eval_mode=True, eval_aug=attack_modules[name])
             decoded_msgs = torch.sign(fts) > 0 # b k -> b k
             diff = (~torch.logical_xor(ori_msgs, decoded_msgs)) # b k -> b k
             log_stats[f'bit_acc_{name}'] = diff.float().mean().item()
@@ -453,8 +533,16 @@ def eval_one_epoch(encoder_decoder: models.EncoderDecoder, loader, epoch, params
             metric_logger.update(**{name:loss})
         
         if epoch % params.saveimg_freq == 0 and it == 0 and utils.is_main_process():
-            save_image(utils_img.unnormalize_img(imgs), os.path.join(params.output_dir, f'{epoch:03}_{it:03}_val_ori.png'), nrow=8)
-            save_image(utils_img.unnormalize_img(imgs_w), os.path.join(params.output_dir, f'{epoch:03}_{it:03}_val_w.png'), nrow=8)
+            utils.create_folder_and_save_image(
+                utils_img.unnormalize_img(imgs), 
+                os.path.join(params.output_dir, 'imgs/val_ori', f'{epoch:03}_{it:03}.png'), 
+                nrow=8
+            )
+            utils.create_folder_and_save_image(
+                utils_img.unnormalize_img(imgs_w), 
+                os.path.join(params.output_dir, 'imgs/val_w', f'{epoch:03}_{it:03}.png'), 
+                nrow=8
+            )
 
     metric_logger.synchronize_between_processes()
     print("Averaged {} stats:".format('eval'), metric_logger)

@@ -14,10 +14,12 @@ from torchvision.transforms import functional
 
 import kornia.augmentation as K
 from kornia.augmentation import AugmentationBase2D
+import skimage as sk
 
 import utils_img
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 
 class DiffJPEG(nn.Module):
     def __init__(self, quality=50):
@@ -30,8 +32,82 @@ class DiffJPEG(nn.Module):
             img_jpeg = utils_img.jpeg_compress(img_clip, self.quality)
             img_gap = img_jpeg - x
             img_gap = img_gap.detach()
-        img_aug = x+img_gap
+        img_aug = x + img_gap
         return img_aug
+    
+
+class DiffImpulse(nn.Module):
+    def __init__(self, scale=160):
+        super().__init__()
+        self.scale = scale
+    
+    def forward(self, x):
+        with torch.no_grad():
+            imgs_clip = utils_img.unnormalize_img(x).clamp(0, 1)
+            imgs_impulse = np.zeros((x.shape[0], x.shape[2], x.shape[3], x.shape[1]))
+            for ii, img_clip in enumerate(imgs_clip):
+                img_np = np.array(functional.to_pil_image(img_clip)) / 255
+                img_impulse = np.clip(
+                    sk.util.random_noise(img_np, mode="s&p", amount=self.scale), 0, 1
+                )
+                imgs_impulse[ii] = img_impulse
+            imgs_impulse = torch.from_numpy(imgs_impulse).permute(0, 3, 1, 2).float().to(x.device)
+            imgs_gap = utils_img.normalize_img(imgs_impulse) - x
+            imgs_gap = imgs_gap.detach()
+        imgs_aug = x + imgs_gap
+        return imgs_aug
+    
+
+class DiffGaussian(nn.Module):
+    def __init__(self, scale=0.09):
+        super().__init__()
+        self.scale = scale
+
+    def forward(self, x):
+        return x + torch.randn_like(x.detach()) * self.scale
+    
+
+class DiffShot(nn.Module):
+    def __init__(self, scale=160):
+        super().__init__()
+        self.scale = scale
+
+    def forward(self, x):
+        with torch.no_grad():
+            imgs_clip = utils_img.unnormalize_img(x).clamp(0, 1)
+            imgs_shot = np.zeros((x.shape[0], x.shape[2], x.shape[3], x.shape[1]))
+            for ii, img_clip in enumerate(imgs_clip):
+                img_np = np.array(functional.to_pil_image(img_clip)) / 255
+                img_shot = np.clip(
+                    np.random.poisson(img_np * self.scale) / self.scale, 0, 1
+                )
+                imgs_shot[ii] = img_shot
+            imgs_shot = torch.from_numpy(imgs_shot).permute(0, 3, 1, 2).float().to(x.device)
+            imgs_gap = utils_img.normalize_img(imgs_shot) - x
+            imgs_gap = imgs_gap.detach()
+        imgs_aug = x + imgs_gap
+        return imgs_aug
+
+
+class DiffSpeckle(nn.Module):
+    def __init__(self, scale=0.05):
+        super().__init__()
+        self.scale = scale
+
+    def forward(self, x):
+        return x + (x * torch.randn_like(x) * self.scale).detach()
+
+
+class DiffMixup(nn.Module):
+    def __init__(self, alpha=0.9):
+        super().__init__()
+        self.alpha = alpha
+    
+    def forward(self, x):
+        index = torch.randperm(x.size(0)).to(x.device)
+        img1, img2 = x, x[index]
+        return self.alpha * img1 + (1 - self.alpha) * img2.detach()
+
 
 class RandomDiffJPEG(AugmentationBase2D):
     def __init__(self, p, low=10, high=100) -> None:
@@ -103,11 +179,12 @@ class HiddenAug(nn.Module):
             diff_jpeg2 = DiffJPEG(quality=80)  # JPEG80
             augmentations += [diff_jpeg1, diff_jpeg2]
         if p_rot > 0:
-            aff1 = K.RandomAffine(degrees=(-10,10), p=1)
-            aff2 = K.RandomAffine(degrees=(90,90), p=1)
-            aff3 = K.RandomAffine(degrees=(-90,-90), p=1)
-            augmentations += [aff1]
-            augmentations += [aff2, aff3]
+            # aff1 = K.RandomAffine(degrees=(-10,10), p=1)
+            # aff2 = K.RandomAffine(degrees=(90,90), p=1)
+            # aff3 = K.RandomAffine(degrees=(-90,-90), p=1)
+            # augmentations += [aff1]
+            # augmentations += [aff2, aff3]
+            augmentations += [K.RandomRotation(degrees=(-90,90), p=1)]
         if p_color_jitter > 0:
             jitter1 = K.ColorJiggle(brightness=(1.5, 1.5), contrast=0, saturation=0, hue=0, p=1)
             jitter2 = K.ColorJiggle(brightness=0, contrast=(1.5, 1.5), saturation=0, hue=0, p=1)
@@ -118,6 +195,59 @@ class HiddenAug(nn.Module):
         
     def forward(self, x):
         return self.hidden_aug(x)
+    
+
+class HiddenAug_v1(nn.Module):
+    def __init__(self, img_size, p_noisy=0.5, aug_order='parallel', noisy_list=['jpeg']):
+        super().__init__()
+        size1 = int(img_size * np.sqrt(0.3))
+        size2 = int(img_size * np.sqrt(0.7))
+        self.basic_list = [
+            nn.Identity(),
+            K.RandomHorizontalFlip(p=1),
+            K.RandomCrop(size=(size1, size1), p=1),
+            K.RandomCrop(size=(size2, size2), p=1),
+            K.RandomResizedCrop(size=(size1, size1), scale=(1.0, 1.0), p=1),
+            K.RandomResizedCrop(size=(size2, size2), scale=(1.0, 1.0), p=1),
+            K.RandomRotation(degrees=(-90, 90), p=1)
+        ]
+        self.jpeg = [
+            DiffJPEG(quality=50),
+            DiffJPEG(quality=80)
+        ]
+        self.speckle = [
+            DiffSpeckle(scale=0.05),
+            DiffSpeckle(scale=0.10)
+        ]
+        self.shot = [
+            DiffShot(scale=1000),
+            DiffShot(scale=5000)
+        ]
+        self.mixup = [
+            DiffMixup(alpha=0.9),
+            DiffMixup(alpha=0.95)
+        ]
+        self.gaussian = [
+            DiffGaussian(scale=0.06),
+            DiffGaussian(scale=0.10)
+        ]
+        
+        self.noisy_list = noisy_list
+        self.p_noisy = p_noisy
+        self.aug_order = aug_order
+    
+    def forward(self, x):
+        if self.aug_order == 'parallel':
+            if np.random.rand() < 1 - self.p_noisy:
+                aug = np.random.choice(self.basic_list)
+                return aug(x)
+            else:
+                aug_type = np.random.choice(self.noisy_list)
+                aug = np.random.choice(getattr(self, aug_type))
+                return aug(x)
+        elif self.aug_order == 'sequential':
+            raise NotImplementedError
+        
 
 class KorniaAug(nn.Module):
     def __init__(self, degrees=30, crop_scale=(0.2, 1.0), crop_ratio=(3/4, 4/3), blur_size=17, color_jitter=(1.0, 1.0, 1.0, 0.3), diff_jpeg=10,

@@ -10,6 +10,8 @@ import torch.nn as nn
 from timm.models import vision_transformer
 
 import attenuations
+from utils_img import normalize_img, unnormalize_img
+
 
 class ConvBNRelu(nn.Module):
     """
@@ -28,32 +30,46 @@ class ConvBNRelu(nn.Module):
     def forward(self, x):
         return self.layers(x)
 
+
 class HiddenEncoder(nn.Module):
     """
     Inserts a watermark into an image.
     """
-    def __init__(self, num_blocks, num_bits, channels, last_tanh=True):
+    def __init__(self, num_blocks, num_bits, channels, last_tanh=True, skip=False):
         super(HiddenEncoder, self).__init__()
+        self.skip = skip
         layers = [ConvBNRelu(3, channels)]
+        if skip:
+            skip_layers = [nn.Conv2d(3, channels, kernel_size=1)]
 
         for _ in range(num_blocks-1):
-            layer = ConvBNRelu(channels, channels)
-            layers.append(layer)
+            layers.append(ConvBNRelu(channels, channels))
+            if skip:
+                skip_layers.append(nn.Identity())
 
         self.conv_bns = nn.Sequential(*layers)
-        self.after_concat_layer = ConvBNRelu(channels + 3 + num_bits, channels)
+        if skip:
+            self.skip_layers = nn.Sequential(*skip_layers)
 
+        self.after_concat_layer = ConvBNRelu(channels + 3 + num_bits, channels)
         self.final_layer = nn.Conv2d(channels, 3, kernel_size=1)
 
         self.last_tanh = last_tanh
         self.tanh = nn.Tanh()
 
-    def forward(self, imgs, msgs):
+    def _feature_foward_with_skip(self, imgs):
+        for layer, skip_layer in zip(self.conv_bns, self.skip_layers):
+            imgs = layer(imgs) + skip_layer(imgs)
+        return imgs
 
+    def forward(self, imgs, msgs):
         msgs = msgs.unsqueeze(-1).unsqueeze(-1) # b l 1 1
         msgs = msgs.expand(-1,-1, imgs.size(-2), imgs.size(-1)) # b l h w
 
-        encoded_image = self.conv_bns(imgs) # b c h w
+        if self.skip:
+            encoded_image = self._feature_foward_with_skip(imgs) # b c h w
+        else:
+            encoded_image = self.conv_bns(imgs) # b c h w
 
         concat = torch.cat([msgs, encoded_image, imgs], dim=1) # b l+c+3 h w
         im_w = self.after_concat_layer(concat)
@@ -63,6 +79,7 @@ class HiddenEncoder(nn.Module):
             im_w = self.tanh(im_w)
 
         return im_w
+
 
 class HiddenDecoder(nn.Module):
     """
@@ -91,6 +108,52 @@ class HiddenDecoder(nn.Module):
         x = self.linear(x) # b d
         return x
 
+
+class HiddenDecoderSkip(nn.Module):
+    """
+    Decoder module. Receives a watermarked image and extracts the watermark.
+    The input image may have various kinds of noise applied to it,
+    such as Crop, JpegCompression, and so on. See Noise layers for more.
+    """
+    def __init__(self, num_blocks, num_bits, channels, skip=True):
+        super(HiddenDecoderSkip, self).__init__()
+        self.skip = skip
+        layers = [ConvBNRelu(3, channels)]
+        if skip:
+            skip_layers = [nn.Conv2d(3, channels, kernel_size=1)]
+
+        for _ in range(num_blocks - 1):
+            layers.append(ConvBNRelu(channels, channels))
+            if skip:
+                skip_layers.append(nn.Identity())
+
+        self.layers = nn.Sequential(*layers)
+        if skip:
+            self.skip_layers = nn.Sequential(*skip_layers)
+
+        msg_layers = []
+        msg_layers.append(ConvBNRelu(channels, num_bits))
+        msg_layers.append(nn.AdaptiveAvgPool2d(output_size=(1, 1)))
+        self.msg_layers = nn.Sequential(*msg_layers)
+        self.linear = nn.Linear(num_bits, num_bits)
+
+    def _feature_foward_with_skip(self, imgs):
+        for layer, skip_layer in zip(self.layers, self.skip_layers):
+            imgs = layer(imgs) + skip_layer(imgs)
+        return imgs
+
+    def forward(self, img_w):
+        if self.skip:
+            x = self._feature_foward_with_skip(img_w)
+        else:
+            x = self.layers(img_w)
+        x = self.msg_layers(x)  # b d 1 1
+        x = x.squeeze(-1).squeeze(-1) # b d
+        x = self.linear(x) # b d
+        return x
+
+
+
 class ImgEmbed(nn.Module):
     """ Patch to Image Embedding
     """
@@ -103,6 +166,7 @@ class ImgEmbed(nn.Module):
         B, S, CKK = x.shape # ckk = embed_dim
         x = self.proj(x.transpose(1,2).reshape(B, CKK, num_patches_h, num_patches_w)) # b s (c k k) -> b (c k k) s -> b (c k k) sh sw -> b c h w
         return x
+
 
 class VitEncoder(vision_transformer.VisionTransformer):
     """
@@ -146,6 +210,7 @@ class VitEncoder(vision_transformer.VisionTransformer):
             img_w = self.tanh(img_w)
 
         return img_w
+
 
 class DvmarkEncoder(nn.Module):
     """
@@ -208,13 +273,14 @@ class DvmarkEncoder(nn.Module):
 
         return im_w
 
+
 class EncoderDecoder(nn.Module):
     def __init__(
         self, 
         encoder: nn.Module, 
         attenuation: attenuations.JND, 
         augmentation: nn.Module, 
-        decoder:nn.Module,
+        decoder: nn.Module,
         scale_channels: bool,
         scaling_i: float,
         scaling_w: float,
@@ -237,8 +303,9 @@ class EncoderDecoder(nn.Module):
         self,
         imgs: torch.Tensor,
         msgs: torch.Tensor,
-        eval_mode: bool=False,
-        eval_aug: nn.Module=nn.Identity(),
+        eval_mode: bool = False,
+        eval_aug: nn.Module = nn.Identity(),
+        use_atten: bool = False
     ):
         """
         Does the full forward pass of the encoder-decoder network:
@@ -262,14 +329,14 @@ class EncoderDecoder(nn.Module):
             deltas_w = deltas_w * aas[None,:,None,None]
 
         # add heatmaps
-        if self.attenuation is not None:
+        if self.attenuation is not None and use_atten:
             heatmaps = self.attenuation.heatmaps(imgs) # b 1 h w
             deltas_w = deltas_w * heatmaps # # b c h w * b 1 h w -> b c h w
         imgs_w = self.scaling_i * imgs + self.scaling_w * deltas_w # b c h w
 
         # data augmentation
         if eval_mode:
-            imgs_aug = eval_aug(imgs_w)
+            imgs_aug = normalize_img(eval_aug(unnormalize_img(imgs_w).clamp(0, 1)))
             fts = self.decoder(imgs_aug) # b c h w -> b d
         else:
             imgs_aug = self.augmentation(imgs_w)
@@ -279,6 +346,83 @@ class EncoderDecoder(nn.Module):
         fts = torch.sum(fts, dim=-1) # b k r -> b k
 
         return fts, (imgs_w, imgs_aug)
+
+
+class EncoderDecoderWithEnhancer(nn.Module):
+    def __init__(
+        self, 
+        encoder: nn.Module, 
+        attenuation: attenuations.JND, 
+        augmentation: nn.Module, 
+        decoder: nn.Module,
+        enhancer: nn.Module,
+        scale_channels: bool,
+        scaling_i: float,
+        scaling_w: float,
+        num_bits: int,
+        redundancy: int
+    ):
+        super().__init__()
+        self.encoder = encoder
+        self.attenuation = attenuation
+        self.augmentation = augmentation
+        self.decoder = decoder
+        self.enhancer = enhancer
+        # params for the forward pass
+        self.scale_channels = scale_channels
+        self.scaling_i = scaling_i
+        self.scaling_w = scaling_w
+        self.num_bits = num_bits
+        self.redundancy = redundancy
+
+    def forward(
+        self,
+        imgs: torch.Tensor,
+        msgs: torch.Tensor,
+        eval_mode: bool = False,
+        eval_aug: nn.Module = nn.Identity(),
+        use_atten: bool = False
+    ):
+        """
+        Does the full forward pass of the encoder-decoder network:
+        - encodes the message into the image
+        - attenuates the watermark
+        - augments the image
+        - decodes the watermark
+
+        Args:
+            imgs: b c h w
+            msgs: b l
+        """
+
+        # encoder
+        deltas_w = self.encoder(imgs, msgs) # b c h w
+
+        # scaling channels: more weight to blue channel
+        if self.scale_channels:
+            aa = 1/4.6 # such that aas has mean 1
+            aas = torch.tensor([aa*(1/0.299), aa*(1/0.587), aa*(1/0.114)]).to(imgs.device) 
+            deltas_w = deltas_w * aas[None,:,None,None]
+
+        # add heatmaps
+        if self.attenuation is not None and use_atten:
+            heatmaps = self.attenuation.heatmaps(imgs) # b 1 h w
+            deltas_w = deltas_w * heatmaps # # b c h w * b 1 h w -> b c h w
+        imgs_w = self.scaling_i * imgs + self.scaling_w * deltas_w # b c h w
+
+        # data augmentation
+        if eval_mode:
+            imgs_aug = normalize_img(eval_aug(unnormalize_img(imgs_w).clamp(0, 1)))
+            fts = self.decoder(imgs_aug) # b c h w -> b d
+        else:
+            imgs_aug = self.augmentation(imgs_w)
+            fts = self.decoder(imgs_aug) # b c h w -> b d
+            
+        fts = fts.view(-1, self.num_bits, self.redundancy) # b k*r -> b k r
+        fts = torch.sum(fts, dim=-1) # b k r -> b k
+
+        return fts, (imgs_w, imgs_aug)
+
 
 class EncoderWithJND(nn.Module):
     def __init__(

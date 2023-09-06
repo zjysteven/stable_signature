@@ -18,6 +18,7 @@ from PIL import Image
 import torch
 from torch.utils.data import DataLoader, Subset
 from torchvision.datasets.folder import is_image_file, default_loader
+from torchvision.utils import save_image
 
 ### Optimizer building
 

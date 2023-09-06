@@ -22,6 +22,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 from torchvision import models
 from torchvision import datasets
 from torchvision.datasets.folder import is_image_file, default_loader
+from torchvision.utils import save_image
 
 import timm
 import timm.scheduler as scheduler
@@ -84,6 +85,9 @@ def bool_inst(v):
         return False
     else:
         raise ValueError('Boolean value expected in args')
+    
+def string_with_comma(v):
+    return v.split(',')
 
 def get_sha():
     cwd = os.path.dirname(os.path.abspath(__file__))
@@ -132,14 +136,14 @@ class ImageFolder:
     def __len__(self):
         return len(self.samples)
 
-def get_dataloader(data_dir, transform=utils_img.default_transform, batch_size=128, shuffle=True, num_workers=8, custom=True):
+def get_dataloader(data_dir, transform=utils_img.default_transform, batch_size=128, shuffle=True, num_workers=8, drop_last=True, custom=True):
     """ Get dataloader for the images in the data_dir. The data_dir must be of the form: input/0/... """
     dataset = ImageFolder(data_dir, transform=transform) if custom else datasets.ImageFolder(data_dir, transform=transform)
     if is_dist_avail_and_initialized():
         sampler = DistributedSampler(dataset, shuffle=shuffle) 
-        dataloader = DataLoader(dataset, batch_size=batch_size, sampler=sampler, num_workers=num_workers, pin_memory=True, drop_last=True)
+        dataloader = DataLoader(dataset, batch_size=batch_size, sampler=sampler, num_workers=num_workers, pin_memory=True, drop_last=drop_last)
     else:
-        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, pin_memory=True, drop_last=True)
+        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, pin_memory=True, drop_last=drop_last)
     return dataloader
 
 def pil_imgs_from_folder(folder):
@@ -297,7 +301,10 @@ def init_distributed_mode(params):
         hostnames = subprocess.check_output(['scontrol', 'show', 'hostnames', os.environ['SLURM_JOB_NODELIST']])
         params.master_addr = hostnames.split()[0].decode('utf-8')
         if params.master_port==-1:
-            params.master_port = '19500'
+            if "MASTER_PORT" not in os.environ:
+                params.master_port = 19500
+            else:
+                params.master_port = int(os.environ["MASTER_PORT"])
         assert 10001 <= params.master_port <= 20000 or params.world_size == 1
         print(PREFIX + "Master address: %s" % params.master_addr)
         print(PREFIX + "Master port   : %i" % params.master_port)
@@ -536,3 +543,10 @@ class MetricLogger(object):
         total_time_str = str(datetime.timedelta(seconds=int(total_time)))
         print('{} Total time: {} ({:.6f} s / it)'.format(header, total_time_str, total_time / (len(iterable)+1)))
 
+
+def create_folder_and_save_image(imgs, filepath, **kwargs):
+    directory = os.path.dirname(filepath)
+    if not os.path.exists(directory):
+        os.makedirs(directory)
+
+    save_image(imgs, filepath, **kwargs)

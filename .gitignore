@@ -1,0 +1,8 @@
+hidden/output
+*slurm_outputs
+*.pyc
+*.pth
+*.slurm
+*legacy*
+*.ipynb
+*.sh

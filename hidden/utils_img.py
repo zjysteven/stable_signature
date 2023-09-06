@@ -30,11 +30,6 @@ default_transform = transforms.Compose([
 image_mean = torch.Tensor([0.485, 0.456, 0.406]).view(-1, 1, 1)
 image_std = torch.Tensor([0.229, 0.224, 0.225]).view(-1, 1, 1)
 
-normalize_rgb = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-unnormalize_rgb = transforms.Normalize(mean=[-0.485/0.229, -0.456/0.224, -0.406/0.225], std=[1/0.229, 1/0.224, 1/0.225])
-normalize_yuv = transforms.Normalize(mean=[0.5, 0, 0], std=[0.5, 1, 1])
-unnormalize_yuv = transforms.Normalize(mean=[-0.5/0.5, 0, 0], std=[1/0.5, 1/1, 1/1])
-
 
 def normalize_img(x):
     """ Normalize image to approx. [-1,1] """
@@ -112,8 +107,9 @@ def center_crop(x, scale):
     # lower = upper + new_edges_size[1]
 
     # return x.crop((left, upper, right, lower))
+    x = unnormalize_img(x).clamp(0, 1)
     x = functional.center_crop(x, new_edges_size)
-    return x
+    return normalize_img(x)
 
 def resize(x, scale):
     """ Perform center crop such that the target area of the crop is at a given scale
@@ -123,7 +119,8 @@ def resize(x, scale):
     """
     scale = np.sqrt(scale)
     new_edges_size = [int(s*scale) for s in x.shape[-2:]][::-1]
-    return functional.resize(x, new_edges_size)
+    x = unnormalize_img(x).clamp(0, 1)
+    return normalize_img(functional.resize(x, new_edges_size))
 
 def rotate(x, angle):
     """ Rotate image by angle
@@ -131,7 +128,8 @@ def rotate(x, angle):
         x: image (PIl or tensor)
         angle: angle in degrees
     """
-    return functional.rotate(x, angle)
+    x = unnormalize_img(x).clamp(0, 1)
+    return normalize_img(functional.rotate(x, angle))
 
 def adjust_brightness(x, brightness_factor):
     """ Adjust brightness of an image
